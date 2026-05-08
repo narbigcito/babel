@@ -1,0 +1,22 @@
+# Babel Configuration
+# Simple LLM Gateway - OpenAI Compatible API
+
+# Optional: protect Babel with an API key
+# api_key: your-secret-key
+
+providers:
+  moonshot:
+    base_url: https://api.moonshot.ai/v1
+    api_key: sk-cafNftZWFhh4cvUoT0t9gWkeiOCED4v9V0IuACo3VECrxz7h
+
+models:
+  kimi-k2-0711:
+    provider: moonshot
+  kimi-k2.5:
+    provider: moonshot
+  kimi-k2-turbo-preview:
+    provider: moonshot
+
+server:
+  host: 0.0.0.0
+  port: 8787
