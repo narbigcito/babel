@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   babel:
     build: .
@@ -7,13 +5,13 @@ services:
     ports:
       - "8787:8787"
     volumes:
-      - ./data/config.yaml:/root/.babel/config.yaml:ro
+      - ~/.babel/config.yaml:/root/.babel/config.yaml:ro
     environment:
-      - PYTHONUNBUFFERED=1
+      - BABEL_CONFIG=/root/.babel/config.yaml
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8787/health')"]
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/localhost/8787"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 5s
+      start_period: 15s
