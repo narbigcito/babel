@@ -45,8 +45,13 @@ defmodule BabelWeb.ChatLive do
   end
 
   @impl true
-  def handle_info({:chunk, sid, content}, %{assigns: %{stream_id: sid}} = socket) do
-    {:noreply, assign(socket, :messages, append_to_last(socket.assigns.messages, content))}
+  def handle_info({:chunk, sid, {:content, text}}, %{assigns: %{stream_id: sid}} = socket) do
+    {:noreply, assign(socket, :messages, append_content(socket.assigns.messages, text))}
+  end
+
+  @impl true
+  def handle_info({:chunk, sid, {:thinking, text}}, %{assigns: %{stream_id: sid}} = socket) do
+    {:noreply, assign(socket, :messages, append_thinking(socket.assigns.messages, text))}
   end
 
   @impl true
@@ -100,8 +105,8 @@ defmodule BabelWeb.ChatLive do
         {:noreply, assign(socket, :error, "Selecciona un proveedor y modelo primero.")}
 
       true ->
-        user_msg = %{id: new_id(), role: "user", content: content, streaming: false}
-        asst_msg = %{id: new_id(), role: "assistant", content: "", streaming: true}
+        user_msg = %{id: new_id(), role: "user", content: content, thinking: "", streaming: false}
+        asst_msg = %{id: new_id(), role: "assistant", content: "", thinking: "", streaming: true}
         messages = socket.assigns.messages ++ [user_msg, asst_msg]
 
         api_messages =
@@ -160,7 +165,7 @@ defmodule BabelWeb.ChatLive do
               {chunks, buf} = parse_sse(buf)
               Enum.each(chunks, fn
                 :done -> :ok
-                text -> send(pid, {:chunk, sid, text})
+                chunk -> send(pid, {:chunk, sid, chunk})
               end)
               buf
             _, buf -> buf
@@ -192,12 +197,25 @@ defmodule BabelWeb.ChatLive do
       |> Enum.filter(&String.starts_with?(&1, "data: "))
       |> Enum.flat_map(fn line ->
         json = binary_part(line, 6, byte_size(line) - 6)
+
         case json do
-          "[DONE]" -> [:done]
+          "[DONE]" ->
+            [:done]
+
           _ ->
             case Jason.decode(json) do
-              {:ok, %{"choices" => [%{"delta" => %{"content" => c}} | _]}} when is_binary(c) -> [c]
-              _ -> []
+              {:ok, %{"choices" => [%{"delta" => delta} | _]}} ->
+                [
+                  {delta["content"], :content},
+                  {delta["reasoning_content"], :thinking}
+                ]
+                |> Enum.flat_map(fn
+                  {text, type} when is_binary(text) and text != "" -> [{type, text}]
+                  _ -> []
+                end)
+
+              _ ->
+                []
             end
         end
       end)
@@ -238,8 +256,11 @@ defmodule BabelWeb.ChatLive do
     |> Enum.sort()
   end
 
-  defp append_to_last(msgs, content),
-    do: List.update_at(msgs, -1, &%{&1 | content: &1.content <> content})
+  defp append_content(msgs, text),
+    do: List.update_at(msgs, -1, &%{&1 | content: &1.content <> text})
+
+  defp append_thinking(msgs, text),
+    do: List.update_at(msgs, -1, &%{&1 | thinking: &1.thinking <> text})
 
   defp mark_done(msgs),
     do: List.update_at(msgs, -1, &%{&1 | streaming: false})
@@ -349,6 +370,26 @@ defmodule BabelWeb.ChatLive do
                   <div class="text-xs text-zinc-600 mb-1.5 font-medium">
                     <%= @selected_model %>
                   </div>
+                  <%!-- Thinking block (colapsable) --%>
+                  <%= if msg.thinking != "" do %>
+                    <details class="mb-2 group">
+                      <summary class="text-xs text-zinc-600 hover:text-zinc-400 cursor-pointer select-none
+                                      flex items-center gap-1 list-none">
+                        <span class="group-open:rotate-90 transition-transform inline-block">▶</span>
+                        <span class="italic">
+                          Pensando<%= if msg.streaming and msg.content == "", do: "...", else: "" %>
+                        </span>
+                      </summary>
+                      <div class="mt-2 pl-3 border-l border-zinc-700 text-xs text-zinc-500
+                                  leading-relaxed whitespace-pre-wrap max-h-48 overflow-y-auto">
+                        <%= msg.thinking %>
+                        <%= if msg.streaming and msg.content == "" do %>
+                          <span class="inline-block w-0.5 h-[1em] bg-zinc-600 animate-pulse ml-px align-text-bottom"></span>
+                        <% end %>
+                      </div>
+                    </details>
+                  <% end %>
+
                   <div class="bg-zinc-900 border border-zinc-800 rounded-2xl rounded-tl-md
                               px-4 py-3 text-sm leading-relaxed text-zinc-100 shadow-sm">
                     <%= if msg.content == "" and msg.streaming do %>

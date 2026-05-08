@@ -25,6 +25,10 @@ defmodule Babel.ConfigLoader do
     GenServer.call(__MODULE__, {:delete_provider, name})
   end
 
+  def sync_provider_models(provider_name, model_ids) do
+    GenServer.call(__MODULE__, {:sync_provider_models, provider_name, model_ids})
+  end
+
   @impl true
   def init(_), do: {:ok, load_config()}
 
@@ -52,6 +56,28 @@ defmodule Babel.ConfigLoader do
       :ok ->
         broadcast(new_state)
         {:reply, :ok, new_state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  @impl true
+  def handle_call({:sync_provider_models, provider_name, model_ids}, _from, state) do
+    # Remove existing models for this provider, add the new ones
+    kept = state.models |> Enum.reject(fn {_, m} -> m.provider == provider_name end) |> Map.new()
+
+    synced =
+      model_ids
+      |> Enum.map(fn id -> {id, %Model{name: id, provider: provider_name}} end)
+      |> Map.new()
+
+    new_state = %{state | models: Map.merge(kept, synced)}
+
+    case write_config(new_state) do
+      :ok ->
+        broadcast(new_state)
+        {:reply, {:ok, map_size(synced)}, new_state}
 
       {:error, reason} ->
         {:reply, {:error, reason}, state}

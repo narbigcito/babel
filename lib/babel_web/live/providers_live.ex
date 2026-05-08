@@ -2,6 +2,7 @@ defmodule BabelWeb.ProvidersLive do
   use BabelWeb, :live_view
 
   alias Babel.ConfigLoader
+  require Logger
 
   @empty_form %{"name" => "", "base_url" => "", "api_key" => "", "default_headers" => ""}
 
@@ -15,16 +16,34 @@ defmodule BabelWeb.ProvidersLive do
      socket
      |> assign(:page_title, "Providers")
      |> assign(:providers, config.providers)
+     |> assign(:models, config.models)
      |> assign(:mode, :list)
      |> assign(:form_data, @empty_form)
      |> assign(:errors, %{})
      |> assign(:confirm_delete, nil)
-     |> assign(:flash_msg, nil)}
+     |> assign(:flash_msg, nil)
+     |> assign(:syncing, MapSet.new())}
   end
 
   @impl true
   def handle_info({:config_updated, config}, socket) do
-    {:noreply, assign(socket, :providers, config.providers)}
+    {:noreply, socket |> assign(:providers, config.providers) |> assign(:models, config.models)}
+  end
+
+  @impl true
+  def handle_info({:sync_done, name, count}, socket) do
+    {:noreply,
+     socket
+     |> assign(:syncing, MapSet.delete(socket.assigns.syncing, name))
+     |> assign(:flash_msg, {:ok, "#{count} modelos sincronizados para '#{name}'."})}
+  end
+
+  @impl true
+  def handle_info({:sync_error, name, reason}, socket) do
+    {:noreply,
+     socket
+     |> assign(:syncing, MapSet.delete(socket.assigns.syncing, name))
+     |> assign(:flash_msg, {:error, "Error al sincronizar '#{name}': #{reason}"})}
   end
 
   # --- events ---
@@ -110,6 +129,47 @@ defmodule BabelWeb.ProvidersLive do
   @impl true
   def handle_event("dismiss_flash", _params, socket) do
     {:noreply, assign(socket, :flash_msg, nil)}
+  end
+
+  @impl true
+  def handle_event("sync_models", %{"name" => name}, socket) do
+    provider = socket.assigns.providers[name]
+    lv_pid = self()
+
+    Task.start(fn ->
+      url = "#{provider.base_url}/models"
+      headers = [{"authorization", "Bearer #{provider.api_key}"}]
+      request = Finch.build(:get, url, headers)
+
+      case Finch.request(request, Babel.Finch) do
+        {:ok, %{status: 200, body: body}} ->
+          case Jason.decode(body) do
+            {:ok, %{"data" => models}} ->
+              ids = Enum.map(models, & &1["id"]) |> Enum.filter(&is_binary/1)
+
+              case ConfigLoader.sync_provider_models(name, ids) do
+                {:ok, count} -> send(lv_pid, {:sync_done, name, count})
+                {:error, reason} -> send(lv_pid, {:sync_error, name, reason})
+              end
+
+            _ ->
+              send(lv_pid, {:sync_error, name, "Respuesta inesperada del proveedor"})
+          end
+
+        {:ok, %{status: status, body: body}} ->
+          msg = case Jason.decode(body) do
+            {:ok, %{"error" => %{"message" => m}}} -> m
+            _ -> "HTTP #{status}"
+          end
+          send(lv_pid, {:sync_error, name, msg})
+
+        {:error, exception} ->
+          Logger.error("Sync models error: #{Exception.message(exception)}")
+          send(lv_pid, {:sync_error, name, Exception.message(exception)})
+      end
+    end)
+
+    {:noreply, assign(socket, :syncing, MapSet.put(socket.assigns.syncing, name))}
   end
 
   # --- validation ---
@@ -247,19 +307,33 @@ defmodule BabelWeb.ProvidersLive do
                 <tr class="text-xs text-zinc-500 uppercase tracking-wider border-b border-zinc-800">
                   <th class="text-left px-4 py-3">Nombre</th>
                   <th class="text-left px-4 py-3">Base URL</th>
-                  <th class="text-left px-4 py-3">API Key</th>
+                  <th class="text-left px-4 py-3">Modelos</th>
                   <th class="px-4 py-3"></th>
                 </tr>
               </thead>
               <tbody>
                 <%= for {name, provider} <- Enum.sort_by(@providers, fn {n, _} -> n end) do %>
-                  <tr class="border-t border-zinc-800 hover:bg-zinc-800/40">
-                    <td class="px-4 py-3 font-semibold text-zinc-200"><%= name %></td>
-                    <td class="px-4 py-3 text-zinc-400 text-xs"><%= provider.base_url %></td>
-                    <td class="px-4 py-3 text-zinc-600 text-xs font-mono">
-                      <%= mask_key(provider.api_key) %>
+                  <% provider_models = @models |> Enum.filter(fn {_, m} -> m.provider == name end) |> Enum.map(fn {n, _} -> n end) |> Enum.sort() %>
+                  <tr class="border-t border-zinc-800 hover:bg-zinc-800/40 align-top">
+                    <td class="px-4 py-3 font-semibold text-zinc-200 whitespace-nowrap">
+                      <%= name %>
+                      <div class="text-xs text-zinc-600 font-normal font-mono mt-0.5"><%= mask_key(provider.api_key) %></div>
                     </td>
-                    <td class="px-4 py-3 text-right">
+                    <td class="px-4 py-3 text-zinc-500 text-xs"><%= provider.base_url %></td>
+                    <td class="px-4 py-3">
+                      <%= if provider_models == [] do %>
+                        <span class="text-zinc-700 text-xs italic">Sin modelos</span>
+                      <% else %>
+                        <div class="flex flex-wrap gap-1">
+                          <%= for m <- provider_models do %>
+                            <span class="text-xs bg-zinc-800 text-zinc-400 px-1.5 py-0.5 rounded border border-zinc-700">
+                              <%= m %>
+                            </span>
+                          <% end %>
+                        </div>
+                      <% end %>
+                    </td>
+                    <td class="px-4 py-3 text-right whitespace-nowrap">
                       <%= if @confirm_delete == name do %>
                         <span class="text-xs text-zinc-400 mr-2">¿Eliminar?</span>
                         <button phx-click="delete" phx-value-name={name}
@@ -267,10 +341,20 @@ defmodule BabelWeb.ProvidersLive do
                           Sí
                         </button>
                         <button phx-click="cancel"
-                          class="text-xs text-zinc-500 hover:text-zinc-300">
-                          No
-                        </button>
+                          class="text-xs text-zinc-500 hover:text-zinc-300">No</button>
                       <% else %>
+                        <button
+                          phx-click="sync_models" phx-value-name={name}
+                          disabled={MapSet.member?(@syncing, name)}
+                          title="Obtener modelos disponibles del proveedor"
+                          class="text-xs text-indigo-500 hover:text-indigo-300 mr-3 transition-colors disabled:opacity-40"
+                        >
+                          <%= if MapSet.member?(@syncing, name) do %>
+                            <span class="inline-block animate-spin">↻</span> Sync
+                          <% else %>
+                            ↻ Sync
+                          <% end %>
+                        </button>
                         <button phx-click="edit" phx-value-name={name}
                           class="text-xs text-zinc-400 hover:text-white mr-3 transition-colors">
                           Editar
