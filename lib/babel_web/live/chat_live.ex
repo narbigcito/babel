@@ -2,6 +2,7 @@ defmodule BabelWeb.ChatLive do
   use BabelWeb, :live_view
 
   alias Babel.ConfigLoader
+  require Logger
 
   @impl true
   def mount(_params, _session, socket) do
@@ -150,6 +151,8 @@ defmodule BabelWeb.ChatLive do
 
         body = Jason.encode!(%{model: model, messages: messages, stream: true})
 
+        Logger.info("Chat stream → #{url} model=#{model}")
+
         try do
           Finch.stream(Finch.build(:post, url, headers, body), Babel.Finch, "", fn
             {:data, raw}, buf ->
@@ -165,10 +168,13 @@ defmodule BabelWeb.ChatLive do
 
           send(pid, {:stream_done, sid})
         rescue
-          e -> send(pid, {:stream_error, sid, Exception.message(e)})
+          e ->
+            Logger.error("Chat stream error: #{Exception.message(e)}")
+            send(pid, {:stream_error, sid, Exception.message(e)})
         end
 
       {:error, reason} ->
+        Logger.error("Chat resolve error: #{reason}")
         send(pid, {:stream_error, sid, reason})
     end
   end

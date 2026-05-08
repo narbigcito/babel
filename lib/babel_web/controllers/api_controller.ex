@@ -38,18 +38,14 @@ defmodule BabelWeb.ApiController do
 
   # --- /v1/chat/completions ---
 
-  def chat_completions(conn, _params) do
+  def chat_completions(conn, params) do
     with :ok <- check_api_key(conn),
-         {:ok, body, conn} <- Plug.Conn.read_body(conn, length: 10_000_000),
-         {:ok, params} <- Jason.decode(body),
          model = Map.get(params, "model", "unknown"),
          {:ok, {provider, model_cfg}} <- resolve_provider(model) do
       params = maybe_fix_kimi_temperature(params, model)
       target_url = "#{provider.base_url}/chat/completions"
-
       headers = build_headers(provider, model_cfg)
       request = Finch.build(:post, target_url, headers, Jason.encode!(params))
-
       start_ms = System.monotonic_time(:millisecond)
 
       if Map.get(params, "stream", false) do
@@ -58,8 +54,6 @@ defmodule BabelWeb.ApiController do
         do_regular(conn, request, model, start_ms)
       end
     else
-      :ok -> conn
-      {:error, %Jason.DecodeError{}} -> send_error(conn, 400, "Invalid JSON body")
       {:error, reason} when is_binary(reason) -> send_error(conn, 404, reason)
       {:error, reason} -> send_error(conn, 400, inspect(reason))
     end
