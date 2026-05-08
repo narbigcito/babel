@@ -19,6 +19,7 @@ defmodule BabelWeb.Router do
     live "/", DashboardLive
     live "/dashboard", DashboardLive
     live "/providers", ProvidersLive
+    live "/chat", ChatLive
   end
 
   scope "/", BabelWeb do
