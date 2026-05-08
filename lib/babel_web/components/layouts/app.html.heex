@@ -9,6 +9,15 @@
   <.link navigate="/chat" class="text-sm text-zinc-400 hover:text-white transition-colors">
     Chat
   </.link>
+  <.link navigate="/users" class="text-sm text-zinc-400 hover:text-white transition-colors">
+    Usuarios
+  </.link>
+  <div class="flex-1" />
+  <%= if auth_enabled?() do %>
+    <.link href="/logout" method="delete" class="text-xs text-zinc-600 hover:text-zinc-400 transition-colors">
+      Salir
+    </.link>
+  <% end %>
 </nav>
 
 <%= @inner_content %>

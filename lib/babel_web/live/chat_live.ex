@@ -4,6 +4,8 @@ defmodule BabelWeb.ChatLive do
   alias Babel.ConfigLoader
   require Logger
 
+  @virtual_provider "personalizado"
+
   @impl true
   def mount(_params, _session, socket) do
     if connected?(socket), do: Phoenix.PubSub.subscribe(Babel.PubSub, "babel:config")
@@ -22,7 +24,15 @@ defmodule BabelWeb.ChatLive do
      |> assign(:input, "")
      |> assign(:streaming, false)
      |> assign(:stream_id, nil)
-     |> assign(:error, nil)}
+     |> assign(:error, nil)
+     |> assign(:show_settings, false)
+     |> assign(:system_prompt, "")
+     |> assign(:temperature, "")
+     |> assign(:max_tokens, "")
+     |> assign(:thinking_enabled, false)
+     |> assign(:thinking_budget, "10000")
+     |> assign(:preset_name_input, "")
+     |> assign(:virtual_provider, @virtual_provider)}
   end
 
   @impl true
@@ -31,10 +41,17 @@ defmodule BabelWeb.ChatLive do
     model = socket.assigns.selected_model
 
     {provider, model} =
-      if Map.has_key?(config.providers, provider) and
-           Enum.any?(config.models, fn {_, m} -> m.provider == provider and m.name == model end),
-         do: {provider, model},
-         else: default_selection(config)
+      cond do
+        provider == @virtual_provider and Map.has_key?(config.presets, model) ->
+          {provider, model}
+
+        provider != @virtual_provider and Map.has_key?(config.providers, provider) and
+            Enum.any?(config.models, fn {_, m} -> m.provider == provider and m.name == model end) ->
+          {provider, model}
+
+        true ->
+          default_selection(config)
+      end
 
     {:noreply,
      socket
@@ -75,17 +92,33 @@ defmodule BabelWeb.ChatLive do
   @impl true
   def handle_event("select_provider", %{"provider" => name}, socket) do
     models = models_for(socket.assigns.config, name)
+    first = List.first(models)
 
-    {:noreply,
-     socket
-     |> assign(:selected_provider, name)
-     |> assign(:selected_model, List.first(models))
-     |> assign(:models_for_provider, models)}
+    socket =
+      socket
+      |> assign(:selected_provider, name)
+      |> assign(:selected_model, first)
+      |> assign(:models_for_provider, models)
+
+    socket = if name == @virtual_provider and first != nil,
+      do: load_preset_settings(socket, socket.assigns.config.presets[first]),
+      else: socket
+
+    {:noreply, socket}
   end
 
   @impl true
   def handle_event("select_model", %{"model" => name}, socket) do
-    {:noreply, assign(socket, :selected_model, name)}
+    socket = assign(socket, :selected_model, name)
+
+    socket =
+      if socket.assigns.selected_provider == @virtual_provider do
+        load_preset_settings(socket, socket.assigns.config.presets[name])
+      else
+        socket
+      end
+
+    {:noreply, socket}
   end
 
   @impl true
@@ -94,14 +127,94 @@ defmodule BabelWeb.ChatLive do
   end
 
   @impl true
+  def handle_event("toggle_settings", _params, socket) do
+    {:noreply, assign(socket, :show_settings, !socket.assigns.show_settings)}
+  end
+
+  @impl true
+  def handle_event("update_settings", params, socket) do
+    socket =
+      socket
+      |> assign(:system_prompt, Map.get(params, "system_prompt", socket.assigns.system_prompt))
+      |> assign(:temperature, Map.get(params, "temperature", socket.assigns.temperature))
+      |> assign(:max_tokens, Map.get(params, "max_tokens", socket.assigns.max_tokens))
+      |> assign(:thinking_budget, Map.get(params, "thinking_budget", socket.assigns.thinking_budget))
+      |> assign(:preset_name_input, Map.get(params, "preset_name", socket.assigns.preset_name_input))
+
+    {:noreply, socket}
+  end
+
+  @impl true
+  def handle_event("reset_temperature", _params, socket) do
+    {:noreply, assign(socket, :temperature, "")}
+  end
+
+  @impl true
+  def handle_event("toggle_thinking", _params, socket) do
+    {:noreply, assign(socket, :thinking_enabled, !socket.assigns.thinking_enabled)}
+  end
+
+  @impl true
+  def handle_event("save_preset", _params, socket) do
+    name = String.trim(socket.assigns.preset_name_input)
+
+    if name == "" do
+      {:noreply, assign(socket, :error, "El nombre del preset no puede estar vacío.")}
+    else
+      {provider, model} = effective_provider_model(socket)
+
+      attrs = %{
+        "provider" => provider,
+        "model" => model,
+        "system_prompt" => socket.assigns.system_prompt,
+        "temperature" => socket.assigns.temperature,
+        "max_tokens" => socket.assigns.max_tokens,
+        "thinking_enabled" => socket.assigns.thinking_enabled,
+        "thinking_budget" => socket.assigns.thinking_budget
+      }
+
+      case ConfigLoader.upsert_preset(name, attrs) do
+        :ok ->
+          {:noreply,
+           socket
+           |> assign(:preset_name_input, "")
+           |> assign(:error, nil)}
+
+        {:error, reason} ->
+          {:noreply, assign(socket, :error, "Error al guardar: #{reason}")}
+      end
+    end
+  end
+
+  @impl true
+  def handle_event("delete_preset", %{"name" => name}, socket) do
+    case ConfigLoader.delete_preset(name) do
+      :ok ->
+        socket =
+          if socket.assigns.selected_provider == @virtual_provider and
+               socket.assigns.selected_model == name do
+            assign(socket, :selected_provider, nil) |> assign(:selected_model, nil)
+          else
+            socket
+          end
+
+        {:noreply, socket}
+
+      {:error, reason} ->
+        {:noreply, assign(socket, :error, "Error: #{reason}")}
+    end
+  end
+
+  @impl true
   def handle_event("send_message", %{"input" => content}, socket) do
     content = String.trim(content)
+    {_provider, api_model} = effective_provider_model(socket)
 
     cond do
       content == "" or socket.assigns.streaming ->
         {:noreply, socket}
 
-      socket.assigns.selected_model == nil ->
+      api_model == nil ->
         {:noreply, assign(socket, :error, "Selecciona un proveedor y modelo primero.")}
 
       true ->
@@ -114,12 +227,24 @@ defmodule BabelWeb.ChatLive do
             %{"role" => m.role, "content" => m.content}
           end)
 
+        api_messages =
+          case String.trim(socket.assigns.system_prompt) do
+            "" -> api_messages
+            sp -> [%{"role" => "system", "content" => sp} | api_messages]
+          end
+
         sid = new_id()
         lv_pid = self()
-        model = socket.assigns.selected_model
         config = socket.assigns.config
 
-        Task.start(fn -> stream_chat(lv_pid, sid, model, api_messages, config) end)
+        chat_opts = %{
+          temperature: parse_float(socket.assigns.temperature),
+          max_tokens: parse_int(socket.assigns.max_tokens),
+          thinking_enabled: socket.assigns.thinking_enabled,
+          thinking_budget: parse_int(socket.assigns.thinking_budget) || 10000
+        }
+
+        Task.start(fn -> stream_chat(lv_pid, sid, api_model, api_messages, config, chat_opts) end)
 
         {:noreply,
          socket
@@ -144,7 +269,7 @@ defmodule BabelWeb.ChatLive do
 
   # --- streaming worker ---
 
-  defp stream_chat(pid, sid, model, messages, config) do
+  defp stream_chat(pid, sid, model, messages, config, opts) do
     case resolve_provider(config, model) do
       {:ok, {provider, model_cfg}} ->
         url = "#{provider.base_url}/chat/completions"
@@ -154,24 +279,51 @@ defmodule BabelWeb.ChatLive do
             Enum.map(provider.default_headers, &{elem(&1, 0), elem(&1, 1)}) ++
             Enum.map(model_cfg.extra_headers, &{elem(&1, 0), elem(&1, 1)})
 
-        body = Jason.encode!(%{model: model, messages: messages, stream: true})
+        body_map =
+          %{model: model, messages: messages, stream: true}
+          |> maybe_put(:temperature, opts.temperature)
+          |> maybe_put(:max_tokens, opts.max_tokens)
+          |> then(fn m ->
+            if opts.thinking_enabled do
+              Map.put(m, :thinking, %{type: "enabled", budget_tokens: opts.thinking_budget})
+            else
+              m
+            end
+          end)
+
+        body = Jason.encode!(body_map)
 
         Logger.info("Chat stream → #{url} model=#{model}")
 
         try do
-          Finch.stream(Finch.build(:post, url, headers, body), Babel.Finch, "", fn
-            {:data, raw}, buf ->
-              buf = buf <> raw
-              {chunks, buf} = parse_sse(buf)
-              Enum.each(chunks, fn
-                :done -> :ok
-                chunk -> send(pid, {:chunk, sid, chunk})
-              end)
-              buf
-            _, buf -> buf
-          end)
+          result =
+            Finch.stream(
+              Finch.build(:post, url, headers, body),
+              Babel.Finch,
+              %{buf: "", status: nil},
+              fn
+                {:status, status}, acc -> %{acc | status: status}
+                {:data, raw}, acc ->
+                  buf = acc.buf <> raw
+                  {chunks, buf} = parse_sse(buf)
+                  Enum.each(chunks, fn
+                    :done -> :ok
+                    chunk -> send(pid, {:chunk, sid, chunk})
+                  end)
+                  %{acc | buf: buf}
+                _, acc -> acc
+              end
+            )
 
-          send(pid, {:stream_done, sid})
+          case result do
+            {:ok, %{status: s, buf: body_buf}} when s != 200 ->
+              reason = extract_api_error(body_buf, s)
+              Logger.error("Chat stream HTTP #{s}: #{reason}")
+              send(pid, {:stream_error, sid, reason})
+
+            _ ->
+              send(pid, {:stream_done, sid})
+          end
         rescue
           e ->
             Logger.error("Chat stream error: #{Exception.message(e)}")
@@ -231,12 +383,64 @@ defmodule BabelWeb.ChatLive do
         end)
 
     case cfg do
-      nil -> {:error, "Modelo '#{model}' no encontrado"}
+      nil -> {:error, "Modelo '#{model}' no encontrado en la configuración"}
       c ->
         case config.providers[c.provider] do
           nil -> {:error, "Proveedor '#{c.provider}' no configurado"}
           p -> {:ok, {p, c}}
         end
+    end
+  end
+
+  defp effective_provider_model(socket) do
+    if socket.assigns.selected_provider == @virtual_provider do
+      preset = socket.assigns.config.presets[socket.assigns.selected_model]
+      if preset, do: {preset.provider, preset.model}, else: {nil, nil}
+    else
+      {socket.assigns.selected_provider, socket.assigns.selected_model}
+    end
+  end
+
+  defp load_preset_settings(socket, nil), do: socket
+
+  defp load_preset_settings(socket, preset) do
+    socket
+    |> assign(:system_prompt, preset.system_prompt || "")
+    |> assign(:temperature, if(preset.temperature != nil, do: to_string(preset.temperature), else: ""))
+    |> assign(:max_tokens, if(preset.max_tokens != nil, do: to_string(preset.max_tokens), else: ""))
+    |> assign(:thinking_enabled, preset.thinking_enabled)
+    |> assign(:thinking_budget, to_string(preset.thinking_budget))
+  end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  defp extract_api_error(body, status) do
+    case Jason.decode(body) do
+      {:ok, %{"error" => %{"message" => msg}}} -> msg
+      {:ok, %{"message" => msg}} -> msg
+      {:ok, %{"error" => msg}} when is_binary(msg) -> msg
+      _ -> "HTTP #{status}"
+    end
+  end
+
+  defp parse_float(""), do: nil
+  defp parse_float(nil), do: nil
+
+  defp parse_float(str) do
+    case Float.parse(to_string(str)) do
+      {f, _} -> f
+      :error -> nil
+    end
+  end
+
+  defp parse_int(""), do: nil
+  defp parse_int(nil), do: nil
+
+  defp parse_int(str) do
+    case Integer.parse(to_string(str)) do
+      {i, _} when i > 0 -> i
+      _ -> nil
     end
   end
 
@@ -248,6 +452,11 @@ defmodule BabelWeb.ChatLive do
   end
 
   defp models_for(_config, nil), do: []
+  defp models_for(_config, ""), do: []
+
+  defp models_for(config, @virtual_provider) do
+    config.presets |> Map.keys() |> Enum.sort()
+  end
 
   defp models_for(config, provider) do
     config.models
@@ -291,6 +500,11 @@ defmodule BabelWeb.ChatLive do
             <%= for {name, _} <- Enum.sort(@config.providers) do %>
               <option value={name} selected={name == @selected_provider}><%= name %></option>
             <% end %>
+            <%= if map_size(@config.presets) > 0 do %>
+              <option value={@virtual_provider} selected={@selected_provider == @virtual_provider}>
+                ★ Personalizado
+              </option>
+            <% end %>
           <% end %>
         </select>
 
@@ -320,7 +534,179 @@ defmodule BabelWeb.ChatLive do
             Limpiar
           </button>
         <% end %>
+
+        <button
+          phx-click="toggle_settings"
+          title="Configuración"
+          class={[
+            "flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs transition-colors",
+            if(@show_settings,
+              do: "bg-indigo-600/20 text-indigo-400 border border-indigo-500/40",
+              else: "text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800")
+          ]}
+        >
+          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0
+                 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0
+                 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0
+                 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0
+                 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0
+                 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0
+                 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0
+                 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/>
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
+          </svg>
+          Config
+        </button>
       </div>
+
+      <%!-- Settings panel --%>
+      <%= if @show_settings do %>
+        <div class="bg-zinc-900/80 border-b border-zinc-800 px-4 py-4 flex-shrink-0">
+          <form phx-change="update_settings" class="space-y-4">
+
+            <%!-- System prompt --%>
+            <div>
+              <label class="block text-xs text-zinc-500 mb-1 font-medium">System Prompt</label>
+              <textarea
+                name="system_prompt"
+                rows="2"
+                placeholder="Ej: Eres un asistente útil y conciso."
+                class="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm
+                       text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1
+                       focus:ring-indigo-500 resize-none leading-relaxed"
+              ><%= @system_prompt %></textarea>
+            </div>
+
+            <div class="grid grid-cols-1 gap-4 sm:grid-cols-3">
+
+              <%!-- Temperature --%>
+              <div>
+                <label class="block text-xs text-zinc-500 mb-1 font-medium">
+                  Temperature
+                  <span class="text-zinc-400 ml-1 font-mono">
+                    <%= if @temperature == "", do: "auto", else: @temperature %>
+                  </span>
+                  <%= if @temperature != "" do %>
+                    <button type="button" phx-click="reset_temperature"
+                      class="ml-1 text-zinc-600 hover:text-zinc-400 text-xs">✕</button>
+                  <% end %>
+                </label>
+                <input
+                  type="range" name="temperature"
+                  min="0" max="1" step="0.05"
+                  value={if @temperature == "", do: "0.6", else: @temperature}
+                  class="w-full accent-indigo-500 cursor-pointer"
+                />
+                <div class="flex justify-between text-xs text-zinc-700 mt-0.5">
+                  <span>0 preciso</span>
+                  <span>1 creativo</span>
+                </div>
+              </div>
+
+              <%!-- Max tokens --%>
+              <div>
+                <label class="block text-xs text-zinc-500 mb-1 font-medium">Max Tokens</label>
+                <input
+                  type="number" name="max_tokens"
+                  min="1" max="131072" step="256"
+                  value={@max_tokens}
+                  placeholder="Sin límite"
+                  class="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm
+                         text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1
+                         focus:ring-indigo-500"
+                />
+              </div>
+
+              <%!-- Thinking --%>
+              <div>
+                <label class="block text-xs text-zinc-500 mb-1 font-medium">Thinking</label>
+                <p class="text-xs text-zinc-700 mb-2">Solo kimi-k2.5 / kimi-k2.6</p>
+                <div class="flex items-center gap-3">
+                  <button
+                    type="button"
+                    phx-click="toggle_thinking"
+                    class={[
+                      "relative inline-flex h-5 w-9 flex-shrink-0 cursor-pointer rounded-full border-2",
+                      "border-transparent transition-colors duration-200 focus:outline-none",
+                      if(@thinking_enabled, do: "bg-indigo-600", else: "bg-zinc-700")
+                    ]}
+                  >
+                    <span class={[
+                      "pointer-events-none inline-block h-4 w-4 rounded-full bg-white shadow",
+                      "transform transition duration-200",
+                      if(@thinking_enabled, do: "translate-x-4", else: "translate-x-0")
+                    ]}/>
+                  </button>
+                  <span class="text-xs text-zinc-400">
+                    <%= if @thinking_enabled, do: "Activado", else: "Desactivado" %>
+                  </span>
+                </div>
+                <%= if @thinking_enabled do %>
+                  <div class="mt-2">
+                    <label class="block text-xs text-zinc-600 mb-1">Budget tokens</label>
+                    <input
+                      type="number" name="thinking_budget"
+                      min="1024" max="131072" step="1024"
+                      value={@thinking_budget}
+                      class="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-1.5 text-sm
+                             text-zinc-100 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                    />
+                  </div>
+                <% end %>
+              </div>
+            </div>
+
+            <%!-- Save as preset --%>
+            <div class="pt-3 border-t border-zinc-800">
+              <label class="block text-xs text-zinc-500 mb-2 font-medium">Guardar como preset</label>
+              <div class="flex gap-2">
+                <input
+                  type="text"
+                  name="preset_name"
+                  value={@preset_name_input}
+                  placeholder="Nombre del preset..."
+                  class="flex-1 bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-1.5 text-sm
+                         text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1
+                         focus:ring-indigo-500"
+                />
+                <button
+                  type="button"
+                  phx-click="save_preset"
+                  class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs
+                         font-medium transition-colors whitespace-nowrap"
+                >
+                  Guardar
+                </button>
+              </div>
+            </div>
+
+            <%!-- List of saved presets --%>
+            <%= if map_size(@config.presets) > 0 do %>
+              <div class="pt-2">
+                <label class="block text-xs text-zinc-600 mb-2">Presets guardados</label>
+                <div class="flex flex-wrap gap-2">
+                  <%= for {name, _preset} <- Enum.sort(@config.presets) do %>
+                    <div class="flex items-center gap-1 bg-zinc-800 border border-zinc-700 rounded-lg px-2 py-1">
+                      <span class="text-xs text-zinc-300"><%= name %></span>
+                      <button
+                        type="button"
+                        phx-click="delete_preset"
+                        phx-value-name={name}
+                        class="text-zinc-600 hover:text-red-400 text-xs ml-1 transition-colors"
+                        title="Eliminar preset"
+                      >✕</button>
+                    </div>
+                  <% end %>
+                </div>
+              </div>
+            <% end %>
+
+          </form>
+        </div>
+      <% end %>
 
       <%!-- Error --%>
       <%= if @error do %>
@@ -342,7 +728,11 @@ defmodule BabelWeb.ChatLive do
             </div>
             <%= if @selected_model do %>
               <p class="text-zinc-400 text-sm">
-                Chateando con <span class="text-white font-medium"><%= @selected_model %></span>
+                <%= if @selected_provider == @virtual_provider do %>
+                  Preset <span class="text-white font-medium"><%= @selected_model %></span>
+                <% else %>
+                  Chateando con <span class="text-white font-medium"><%= @selected_model %></span>
+                <% end %>
               </p>
               <p class="text-zinc-600 text-xs">Escribe un mensaje para empezar</p>
             <% else %>
@@ -352,7 +742,6 @@ defmodule BabelWeb.ChatLive do
         <% else %>
           <%= for msg <- @messages do %>
             <%= if msg.role == "user" do %>
-              <%!-- User message --%>
               <div class="flex justify-end">
                 <div class="max-w-[75%] bg-indigo-600 text-white rounded-2xl rounded-tr-md
                             px-4 py-3 text-sm leading-relaxed shadow-lg">
@@ -360,7 +749,6 @@ defmodule BabelWeb.ChatLive do
                 </div>
               </div>
             <% else %>
-              <%!-- Assistant message --%>
               <div class="flex items-start gap-3 max-w-[85%]">
                 <div class="flex-shrink-0 w-8 h-8 rounded-xl bg-zinc-800 border border-zinc-700
                             flex items-center justify-center text-xs font-bold text-indigo-400 mt-0.5">
@@ -370,7 +758,6 @@ defmodule BabelWeb.ChatLive do
                   <div class="text-xs text-zinc-600 mb-1.5 font-medium">
                     <%= @selected_model %>
                   </div>
-                  <%!-- Thinking block (colapsable) --%>
                   <%= if msg.thinking != "" do %>
                     <details class="mb-2 group">
                       <summary class="text-xs text-zinc-600 hover:text-zinc-400 cursor-pointer select-none

@@ -8,6 +8,7 @@ services:
       - ./data/config.yaml:/root/.babel/config.yaml
     environment:
       - BABEL_CONFIG=/root/.babel/config.yaml
+      - BABEL_UI_PASSWORD=
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "bash", "-c", "echo > /dev/tcp/localhost/8787"]
