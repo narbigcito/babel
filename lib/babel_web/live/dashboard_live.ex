@@ -3,18 +3,19 @@ defmodule BabelWeb.DashboardLive do
 
   @impl true
   def mount(_params, _session, socket) do
-    if connected?(socket), do: Phoenix.PubSub.subscribe(Babel.PubSub, "babel:stats")
+    if connected?(socket) do
+      Phoenix.PubSub.subscribe(Babel.PubSub, "babel:stats")
+      Phoenix.PubSub.subscribe(Babel.PubSub, "babel:config")
+    end
 
     config = Babel.ConfigLoader.get()
     stats = Babel.Stats.get()
 
-    socket =
-      socket
-      |> assign(:page_title, "Babel Gateway")
-      |> assign(:config, config)
-      |> assign(:stats, stats)
-
-    {:ok, socket}
+    {:ok,
+     socket
+     |> assign(:page_title, "Dashboard")
+     |> assign(:config, config)
+     |> assign(:stats, stats)}
   end
 
   @impl true
@@ -23,16 +24,17 @@ defmodule BabelWeb.DashboardLive do
   end
 
   @impl true
+  def handle_info({:config_updated, config}, socket) do
+    {:noreply, assign(socket, :config, config)}
+  end
+
+  @impl true
   def render(assigns) do
     ~H"""
     <div class="min-h-screen bg-zinc-950 text-zinc-100 p-6 font-mono">
 
-      <%!-- Header --%>
-      <div class="flex items-center justify-between mb-8">
-        <div class="flex items-center gap-3">
-          <span class="text-2xl font-bold tracking-tight">🗼 Babel</span>
-          <span class="text-zinc-500 text-sm">Universal LLM Gateway</span>
-        </div>
+      <%!-- Status --%>
+      <div class="flex items-center justify-end mb-6">
         <div class="flex items-center gap-2">
           <div class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></div>
           <span class="text-emerald-400 text-sm">live</span>

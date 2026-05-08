@@ -18,6 +18,7 @@ defmodule BabelWeb.Router do
     pipe_through :browser
     live "/", DashboardLive
     live "/dashboard", DashboardLive
+    live "/providers", ProvidersLive
   end
 
   scope "/", BabelWeb do
