@@ -4,7 +4,15 @@ defmodule Babel.Application do
   @impl true
   def start(_type, _args) do
     children = [
-      {Finch, name: Babel.Finch, pools: %{:default => [size: 20, count: 4]}},
+      {Finch,
+       name: Babel.Finch,
+       pools: %{
+         :default => [
+           size: 20,
+           count: 4,
+           conn_opts: [transport_opts: [cacertfile: CAStore.file_path()]]
+         ]
+       }},
       {Phoenix.PubSub, name: Babel.PubSub},
       Babel.ConfigLoader,
       Babel.Stats,

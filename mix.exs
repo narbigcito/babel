@@ -33,6 +33,7 @@ defmodule Babel.MixProject do
       {:jason, "~> 1.4"},
       {:yaml_elixir, "~> 2.9"},
       {:finch, "~> 0.19"},
+      {:castore, "~> 1.0"},
       {:esbuild, "~> 0.8", runtime: Mix.env() == :dev},
       {:tailwind, "~> 0.2", runtime: Mix.env() == :dev}
     ]
